@@ -20,18 +20,76 @@ from string import Template
 
 # Configuration constants
 APP_NAME = "workenv"
+APP_VERSION = "1.0.0"
 DEFAULT_CONFIG_DIRS = [
     os.path.join(os.path.expanduser("~"), f".config/{APP_NAME}"),
     os.path.join(os.path.expanduser("~"), f".{APP_NAME}"),
     os.path.join("/etc", APP_NAME),
 ]
+
 DEFAULT_CONFIG_FILE = "config.yaml"
+SHELL_DIR = "shell"
+INIT_SH_SCRIPT_FILE = "init.sh"
 ENV_CONFIG_PATH = "WORKENV_CONFIG_PATH"
+DEFAULT_CONFIG = {
+        "env": {
+            "PATH": "$PATH:$WORKENV_CONFIG_PATH/bin",
+            "WORKENV_ACTIVE": "true"
+        },
+        "shell": {
+            "init": [
+                "source $WORKENV_CONFIG_PATH/shell/init.sh"
+            ]
+        },
+        "projects": {
+            "example": {
+                "path": "~/Projects/example",
+                "env": {
+                    "PROJECT_ROOT": "$project.path"
+                },
+                "actions": [
+                    {"name": "cd"},
+                    {"name": "git_fetch"},
+                    {
+                        "name": "open", 
+                        "args": "code"
+                    }
+                ]
+            }
+        },
+        "actions": {
+            "cd": [
+                {"exec": "cd $project_path"}
+            ],
+            "git_fetch": [
+                {"exec": "git fetch --all"}
+            ],
+            "open": [
+                {"exec": "$EDITOR ${args[@]}"}
+            ]
+        }
+    }
+
+INIT_SCRIPT = """#!/bin/bash
+# This file is sourced by workenv before running any action
+#
+# You can define functions and variables here that will be available to all actions
+
+function git_sync() {
+    git fetch --all
+    git pull --rebase
+}
+
+# Do not forget to export your functions to use them within shell scripts (see: https://unix.stackexchange.com/questions/727636/use-shell-script-function-directly-on-bash)
+export -f git_sync
+
+# Add your custom functions and variables below
+"""
 
 
 def setup_logging(verbose=False):
     """Configure logging based on verbosity level."""
-    log_level = logging.DEBUG if verbose else logging.INFO
+    log_level = logging.DEBUG if verbose else logging.ERROR
     logging.basicConfig(
         level=log_level,
         format="%(levelname)s: %(message)s"
@@ -87,73 +145,20 @@ def ensure_config_dir():
 
 def create_default_config(config_path):
     """Create a default configuration file."""
-    default_config = {
-        "env": {
-            "PATH": "$PATH:$WORKENV_CONFIG/bin",
-            "WORKENV_ACTIVE": "true"
-        },
-        "shell": {
-            "init": [
-                "source $WORKENV_CONFIG/shell/init.sh"
-            ]
-        },
-        "projects": {
-            "example": {
-                "path": "~/Projects/example",
-                "env": {
-                    "PROJECT_ROOT": "$project.path"
-                },
-                "actions": [
-                    {"name": "cd"},
-                    {"name": "git_fetch"},
-                    {"name": "open", "args": "code"}
-                ]
-            }
-        },
-        "actions": {
-            "cd": [
-                {"exec": "cd $project_path"}
-            ],
-            "git_fetch": [
-                {"exec": "git fetch --all"}
-            ],
-            "open": [
-                {"exec": "$EDITOR ${args[@]}"}
-            ]
-        }
-    }
-    
+    default_config = DEFAULT_CONFIG
     try:
         with open(config_path, 'w') as file:
             yaml.dump(default_config, file, default_flow_style=False)
         
         # Create shell directory and init.sh
-        shell_dir = os.path.join(os.path.dirname(config_path), "shell")
+        shell_dir = os.path.join(os.path.dirname(config_path), SHELL_DIR)
         os.makedirs(shell_dir, exist_ok=True)
         
         # Create a sample init.sh file
-        init_sh_path = os.path.join(shell_dir, "init.sh")
+        init_sh_path = os.path.join(shell_dir, INIT_SH_SCRIPT_FILE)
         with open(init_sh_path, 'w') as file:
-            file.write("""#!/bin/bash
-# This file is sourced by workenv before running any action
-#
-# You can define functions and variables here that will be available to all actions
-
-function git_sync() {
-    git fetch --all
-    git pull --rebase
-}
-
-# Do not forget to export your functions to use them within shell scripts (see: https://unix.stackexchange.com/questions/727636/use-shell-script-function-directly-on-bash)
-export -f git_sync
-
-# Add your custom functions and variables below
-""")
+            file.write(INIT_SCRIPT)
         os.chmod(init_sh_path, 0o755)
-        
-        # Create bin directory
-        bin_dir = os.path.join(os.path.dirname(config_path), "bin")
-        os.makedirs(bin_dir, exist_ok=True)
         
         print(f"Created default configuration file: {config_path}")
         print("Please edit this file to define your projects and actions.")
@@ -204,24 +209,16 @@ def build_context(config, project_name, command_args, config_path, specific_acti
     
     # Create basic context with all available information
     context = {
-        'project_name': project_name,
-        'project_path': os.path.expanduser(project_config.get('path', '')),
-        'args': args_str,
-        'workenv_path': os.getcwd(),
-        'config_path': os.path.dirname(os.path.abspath(os.path.expanduser(config_path)))
+        'WORKENV_PROJECT_NAME': project_name,
+        'WORKENV_PROJECT_PATH': os.path.expanduser(project_config.get('path', '')),
+        'WORKENV_ARGS': args_str,
+        'WORKENV_PATH': os.getcwd(),
+        'WORKENV_CONFIG_PATH': os.path.dirname(os.path.abspath(os.path.expanduser(config_path)))
     }
     
     # Add environment variables to the context
     for key, value in os.environ.items():
         context[key] = value
-    
-    # Add special context values to maintain backward compatibility
-    context['project.name'] = context['project_name']
-    context['project.path'] = context['project_path']
-    context['project.args'] = context['args']
-    context['workenv.args'] = context['args']
-    context['workenv.path'] = context['workenv_path']
-    context['WORKENV_CONFIG'] = context['config_path']
     
     # Add project actions information to context
     if 'actions' in project_config:
@@ -229,10 +226,10 @@ def build_context(config, project_name, command_args, config_path, specific_acti
             if isinstance(action_item, dict):  # Handle extended syntax
                 action_name = action_item.get('name', '')
                 action_args = action_item.get('args', '')
-                context[f'project.actions.{action_name}.name'] = action_name
-                context[f'project.actions.{action_name}.args'] = action_args
+                context[f'PROJECT_ACTIONS_{action_name.upper()}_NAME'] = action_name
+                context[f'PROJECT_ACTIONS_{action_name.upper()}_ARGS'] = action_args
             elif isinstance(action_item, str):  # Handle simple syntax
-                context[f'project.actions.{action_item}.name'] = action_item
+                context[f'PROJECT_ACTIONS_{action_item.upper()}_NAME'] = action_item
     
     return context
 
@@ -262,16 +259,15 @@ def prepare_env_for_execution(config, project_config, context, logger):
             env[key] = value
     
     # Set workenv-specific variables
-    env['WORKENV_PROJECT'] = context['project_name']
-    env['WORKENV_PROJECT_PATH'] = context['project_path']
-    env['WORKENV_CONFIG_PATH'] = context['config_path']
+    env['WORKENV'] = context['WORKENV_PROJECT_NAME']
     
     return env
 
 
 def prepare_shell_script(command, context, config, project_config, temp_dir, logger):
     """Create a temporary shell script that includes environment setup and command execution."""
-    script_path = os.path.join(temp_dir, "workenv_command.sh")
+    # script_path = os.path.join(temp_dir, "workenv_command.sh")
+    script_path = os.path.join("./", "workenv_command.sh")
     
     with open(script_path, 'w') as script:
         script.write("#!/bin/bash\n")
@@ -280,9 +276,7 @@ def prepare_shell_script(command, context, config, project_config, temp_dir, log
         # Add environment variables
         for key, value in context.items():
             if isinstance(value, str):
-                # Sanitize the variable name by replacing dots with underscores
-                sanitized_key = key.replace('.', '_')
-                script.write(f"export {sanitized_key}=\"{value}\"\n")
+                script.write(f"export {key}=\"{value}\"\n")
         
         # Add global shell initialization
         if 'shell' in config and 'init' in config['shell']:
@@ -305,8 +299,8 @@ def prepare_shell_script(command, context, config, project_config, temp_dir, log
                 script.write(f"{expanded_line}\n")
         
         # Define args array
-        if context['args']:
-            args = shlex.split(context['args'])
+        if context['WORKENV_ARGS']:
+            args = shlex.split(context['WORKENV_ARGS'])
             script.write("args=(\n")
             for arg in args:
                 script.write(f"  \"{arg}\"\n")
@@ -323,7 +317,7 @@ def prepare_shell_script(command, context, config, project_config, temp_dir, log
     return script_path
 
 
-def execute_action(action_name, config, context, temp_dir, logger):
+def execute_action(action_name, config, context, temp_dir, logger): #TODO: Refactor to handle multiple actions in one script
     """Execute a specific action from the configuration."""
     # Check if action exists
     if action_name not in config.get('actions', {}):
@@ -334,7 +328,7 @@ def execute_action(action_name, config, context, temp_dir, logger):
     logger.debug(f"Executing action: {action_name}")
     
     # Get project config
-    project_name = context['project_name']
+    project_name = context['WORKENV_PROJECT_NAME']# TODO:
     project_config = config['projects'][project_name]
     
     # Prepare environment for execution
@@ -492,7 +486,7 @@ def edit_config():
         config_path = os.path.join(config_dir, DEFAULT_CONFIG_FILE)
         create_default_config(config_path)
     
-    editor = os.environ.get('EDITOR', 'nano')
+    editor = os.environ.get('EDITOR', 'vim')
     try:
         subprocess.run([editor, config_path], check=True)
     except Exception as e:
@@ -534,7 +528,7 @@ def main():
     
     # Handle version request
     if args.version:
-        print(f"{APP_NAME} version 1.0.0")
+        print(f"{APP_NAME} version {APP_VERSION}")
         return
     
     # Handle configuration management commands
